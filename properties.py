@@ -162,14 +162,13 @@ class RelSearchableNode(DjangoNode):
 		return snode
 
 	class Meta:
-		# Used as Meta of Django
 		# Default selected properties for each search
 		# e.g: default_select = ('name', 'age')
 		# For each search returns only selected properties, in this case they are `name` and `age`
 		# If `default_select` is not declared or is empty, then all properties of the current Node will be returned
 		default_select = ()
 
-		# is equal to unique_together
+		# equivalent to unique_together
 		composite_index = []
 
 	def __hash__(self):
