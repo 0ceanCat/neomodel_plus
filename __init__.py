@@ -1,0 +1,5 @@
+__author__ = '0ceanCat'
+__email__ = 'al15020@hotmail.com'
+__license__ = 'MIT'
+__package__ = 'neomodel_plus'
+__version__ = '0.0.1'
