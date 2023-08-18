@@ -1,6 +1,5 @@
 import datetime
 import inspect
-import time
 from collections import defaultdict
 from io import StringIO
 
@@ -137,6 +136,106 @@ class NodeRelationshipDetail:
         else:
             return RelPath(connected_node_name, rel_type, direction, self.get_linkedNode_cls(connected_node_name))
 
+class _OPERATORS_CLASS:
+    _OPERATORS = {'gt': '>', 'gte': '>=', 'ne': '<>', 'lt': '<', 'lte': '<=',
+                  'startswith': 'STARTS WITH', 'endswith': 'ENDS WITH', 'in': 'IN',
+                  'contains': 'CONTAINS'}
+
+    def __getitem__(self, key):
+        operator = self._OPERATORS.get(key, None)
+        if operator is None:
+            raise KeyError(f"There is no operator named `{key}`")
+        return operator
+
+    def __contains__(self, key):
+        return self._OPERATORS.get(key, None) is not None
+
+OPERATORS = _OPERATORS_CLASS()
+
+def remove_duplication(params):
+    r = []
+    for i in params:
+        if i not in r:
+            r.append(i)
+    return r
+
+def init_dict(d, k):
+    l = d.get(k)
+    if l:
+        return l
+    d[k] = l = []
+    return l
+
+class QueryParser:
+    def __init__(self, node_cls_detail):
+        self.node_cls_detail = node_cls_detail
+
+    def parse_param_list(self, connector, param_list, negated=False):
+        simple_rel_filter = defaultdict(dict)  # relationships directly used by the current Node
+        attr_filter = defaultdict(list)  # attribute conditions for the current Node
+        param_list = remove_duplication(param_list)
+        for param_v in param_list:
+            if isinstance(param_v, Q):
+                sf, af = self.parse_param_list(param_v.connector, param_v.children, param_v.negated)
+                for and_or, rel_attrs in sf.items():
+                    for k, v in rel_attrs.items():
+                        if k not in simple_rel_filter[and_or]:
+                            simple_rel_filter[and_or][k] = []
+                        simple_rel_filter[and_or][k].extend(v)
+                for k, v in af.items():
+                    attr_filter[k].extend(v)
+                continue
+
+            param, v = param_v  # e.g: Q(user__username='root') ->  param = 'user__username', v = 'root'
+            if isinstance(v, tuple) or isinstance(v, set):
+                v = list(v)
+            split_param = param.split("__")
+            operator = '='  # default operator
+
+            if self.node_cls_detail.is_node_property(split_param[0]):
+                param = split_param[0]
+
+                if len(split_param) > 1:
+                    # if it is a query like age__gte=10
+                    # convert 'gte' to operator '>='
+                    operator = OPERATORS[split_param[1]]
+
+                attr_filter[connector].append(KeywordArgument(negated, param, operator, v))
+            elif split_param[0] in ('in_', 'in'):
+                # e.g: Image.filter(in_=[list of images or list of ids])
+                attr_filter[connector].append(KeywordArgument(negated, None, OPERATORS['in'], v, type=SearchType.ID))
+            elif split_param[0] == 'id':
+                # e.g: Image.filter(id=1)
+                attr_filter[connector].append(KeywordArgument(negated, None, operator, v, type=SearchType.ID))
+            elif split_param[0].startswith('rel_'):
+                # search based on relationship property
+                if len(split_param) > 2:
+                    # e.g: rel_tag__quantity__gte=10.
+                    # The relationship that connects the current node and Tag node has property `quantity` >= 10
+                    operator = OPERATORS[split_param[2]]
+
+                l = init_dict(simple_rel_filter[connector], split_param[0][4:])
+                l.append(KeywordArgument(negated, split_param[1], operator, v, type=SearchType.REL_PROP))
+            else:
+                # relationship search
+                if len(split_param) == 1:
+                    l = init_dict(simple_rel_filter[connector], split_param[0])
+                    if isinstance(v, AdvancedNodeSet):
+                        # e.g: Image.filter(tag=Tag.filter(name='a'))
+                        # where `tag` is a declared property in Image class that represents the relationship between Image and Tag
+                        l.append(KeywordArgument(negated, None, operator, v, type=SearchType.RECUR_NSET))
+                    else:
+                        # e.g: Image.filter(tag=Tag())
+                        l.append(KeywordArgument(negated, None, operator, v, type=SearchType.ID))
+
+                else:
+                    # e.g: Image.filter(tag__name__startswith='a')
+                    l = init_dict(simple_rel_filter[connector], split_param[0])
+                    l.append(
+                        KeywordArgument(negated, f"{'__'.join(split_param[1:])}", operator, v, type=SearchType.RECUR_PROP))
+
+        return simple_rel_filter, attr_filter
+
 
 class QueryBuilderResult:
     def __init__(self, cypher, returned_var, type_counter):
@@ -146,22 +245,8 @@ class QueryBuilderResult:
 
 
 class QueryBuilder:
-    class _OPERATORS_CLASS:
-        _OPERATORS = {'gt': '>', 'gte': '>=', 'ne': '<>', 'lt': '<', 'lte': '<=',
-                      'startswith': 'STARTS WITH', 'endswith': 'ENDS WITH', 'in': 'IN',
-                      'contains': 'CONTAINS'}
-
-        def __getitem__(self, key):
-            operator = self._OPERATORS.get(key, None)
-            if operator is None:
-                raise KeyError(f"There is no operator named `{key}`")
-            return operator
-
-        def __contains__(self, key):
-            return self._OPERATORS.get(key, None) is not None
 
     VAR_COUNTER = 0
-    OPERATORS = _OPERATORS_CLASS()
 
     def __init__(self, advanced_filter):
         self.advanced_filter = advanced_filter
@@ -169,6 +254,7 @@ class QueryBuilder:
         self.variable_table = defaultdict(str)
         self.type_counter = defaultdict(int)
         self.query_builder = StringIO()
+        self.parser = QueryParser(self.node_cls_detail)
 
     def _build_query(self, without_return=False, counter=0):
         self.counter = counter
@@ -187,7 +273,7 @@ class QueryBuilder:
             inter_query_connector = queries.connector
             children = [e for e in queries.children if not isinstance(e, tuple)]
             children.extend([e for e in queries.children if isinstance(e, tuple)])
-            children = self._remove_duplication(children)
+            children = remove_duplication(children)
             for i, query in enumerate(children):
                 # e.g: query_1 = Q(age=1) | Q(name_startswith='d')
                 # if convert to cypher it is a combination of filters: WHERE age=1 OR name STARTS WITH 'd'
@@ -210,7 +296,7 @@ class QueryBuilder:
                     _, cls_var = self._get_var(cls_name)
                     self._write(f"MATCH ({cls_var}:{cls_name}) ")
                 else:
-                    simple_rel_filter, attr_filter = self._parse_param_list(inter_param_connector, param_list,
+                    simple_rel_filter, attr_filter = self.parser.parse_param_list(inter_param_connector, param_list,
                                                                             negated)
                     self._make_basic_cypher(attr_filter)
 
@@ -324,73 +410,6 @@ class QueryBuilder:
 
             self._write(" ")
 
-    def _parse_param_list(self, connector, param_list, negated=False):
-        operators = self.OPERATORS
-        simple_rel_filter = defaultdict(dict)  # relationships directly used by the current Node
-        attr_filter = defaultdict(list)  # attribute conditions for the current Node
-        param_list = self._remove_duplication(param_list)
-        for param_v in param_list:
-            if isinstance(param_v, Q):
-                sf, af = self._parse_param_list(param_v.connector, param_v.children, param_v.negated)
-                for and_or, rel_attrs in sf.items():
-                    for k, v in rel_attrs.items():
-                        if k not in simple_rel_filter[and_or]:
-                            simple_rel_filter[and_or][k] = []
-                        simple_rel_filter[and_or][k].extend(v)
-                for k, v in af.items():
-                    attr_filter[k].extend(v)
-                continue
-
-            param, v = param_v  # e.g: Q(user__username='root') ->  param = 'user__username', v = 'root'
-            if isinstance(v, tuple) or isinstance(v, set):
-                v = list(v)
-            split_param = param.split("__")
-            operator = '='  # default operator
-
-            if self.node_cls_detail.is_node_property(split_param[0]):
-                param = split_param[0]
-
-                if len(split_param) > 1:
-                    # if it is a query like age__gte=10
-                    # convert 'gte' to operator '>='
-                    operator = operators[split_param[1]]
-
-                attr_filter[connector].append(KeywordArgument(negated, param, operator, v))
-            elif split_param[0] in ('in_', 'in'):
-                # e.g: Image.filter(in_=[list of images or list of ids])
-                attr_filter[connector].append(KeywordArgument(negated, None, operators['in'], v, type=SearchType.ID))
-            elif split_param[0] == 'id':
-                # e.g: Image.filter(id=1)
-                attr_filter[connector].append(KeywordArgument(negated, None, operator, v, type=SearchType.ID))
-            elif split_param[0].startswith('rel_'):
-                # search based on relationship property
-                if len(split_param) > 2:
-                    # e.g: rel_tag__quantity__gte=10.
-                    # The relationship that connects the current node and Tag node has property `quantity` >= 10
-                    operator = operators[split_param[2]]
-
-                l = self._init_dict(simple_rel_filter[connector], split_param[0][4:])
-                l.append(KeywordArgument(negated, split_param[1], operator, v, type=SearchType.REL_PROP))
-            else:
-                # relationship search
-                if len(split_param) == 1:
-                    l = self._init_dict(simple_rel_filter[connector], split_param[0])
-                    if isinstance(v, AdvancedNodeSet):
-                        # e.g: Image.filter(tag=Tag.filter(name='a'))
-                        # where `tag` is a declared property in Image class that represents the relationship between Image and Tag
-                        l.append(KeywordArgument(negated, None, operator, v, type=SearchType.RECUR_NSET))
-                    else:
-                        # e.g: Image.filter(tag=Tag())
-                        l.append(KeywordArgument(negated, None, operator, v, type=SearchType.ID))
-
-                else:
-                    # e.g: Image.filter(tag__name__startswith='a')
-                    l = self._init_dict(simple_rel_filter[connector], split_param[0])
-                    l.append(
-                        KeywordArgument(negated, f"{'__'.join(split_param[1:])}", operator, v, type=SearchType.RECUR_PROP))
-
-        return simple_rel_filter, attr_filter
-
     def _change_if_v_not_adequate(self, v):
         if isinstance(v, str):
             return f"'{v}'"
@@ -482,7 +501,7 @@ class QueryBuilder:
                 self._write(
                     f"{not_}{self._get_var(rel_type)[1]}.{param} {operator} {self._change_if_v_not_adequate(v)} ")
             else:
-                if operator == self.OPERATORS['in'] and not isinstance(v, list):
+                if operator == OPERATORS['in'] and not isinstance(v, list):
                     v = list(v) if isinstance(v, tuple) else [v]
 
                 self._write(f"{not_}{var}.{param} {operator} {self._change_if_v_not_adequate(v)} ")
@@ -714,13 +733,6 @@ class QueryBuilder:
             raise ValueError("Empty collection detected")
         return nodes
 
-    @staticmethod
-    def _remove_duplication(params):
-        r = []
-        for i in params:
-            if i not in r:
-                r.append(i)
-        return r
 
     @staticmethod
     def _check_type(given_obj, target_type):
@@ -733,14 +745,6 @@ class QueryBuilder:
             raise ValueError(f"Invalid ID values!")
 
         return True
-
-    @staticmethod
-    def _init_dict(d, k):
-        l = d.get(k)
-        if l:
-            return l
-        d[k] = l = []
-        return l
 
 
 class AdvancedNodeSet:
