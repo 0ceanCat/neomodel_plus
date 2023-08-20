@@ -64,6 +64,13 @@ class RelSearchableNode(DjangoNode):
 # How to use
 For now, it is necessary to download this repository, and put it into your project.
 
+# How to create index
+You can find following functions in `utils.py`
++ `install_neo_indexes`, delete and reinstall all user indexes (created by user)
++ `drop_indexes`, delete all user indexes
++ `create_all_indexes`, create all scanned indexes
++ `clean_db`, remove all data
+
 
 # Used libraries
 * Neomodel: https://github.com/neo4j-contrib/neomodel
