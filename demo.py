@@ -86,7 +86,7 @@ if __name__ == '__main__':
     a = Image.filter(user__username='root')
     a &= Q(hash_code='a')
     # Images connected with a Tag node with name='a' or the relationship between them has the property max_score with a value >= 10
-    a &= (Q(tag=Tag.filter(name='a')) | Q(rel_tag__max_score__gte=10))
+    a &= (Q(tag=Tag.filter(~Q(name='a'))) | Q(rel_tag__max_score__gte=10))
     print(a.cypher_query)
     print()
 
