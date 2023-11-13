@@ -1042,10 +1042,7 @@ class QueryBuilder:
             # c = query_1 & query_2. In this case, the connector between the queries is 'AND'
             # c = query_1 | query_2. The connector between the queries is 'OR'
             # if convert these queries to cypher, they will be a combination of MATCH queries
-            children = [e for e in queries.children if not isinstance(e, tuple)]
-            children.extend([e for e in queries.children if isinstance(e, tuple)])
-            children = remove_duplication(children)
-            for i, query in enumerate(children):
+            for i, query in enumerate(queries.children):
                 # e.g: query_1 = Q(age=1) | Q(name_startswith='d')
                 # if convert to cypher it is a combination of filters: WHERE age=1 OR name STARTS WITH 'd'
                 inter_param_connector = CypherKeyWords.AND  # default connector
@@ -1071,6 +1068,10 @@ class QueryBuilder:
                     self.statement_builder.convert_params_to_statements(self.ast,
                                                                         cls_name,
                                                                         conditions)
+
+                if i + 1 < len(queries):
+                    merge = MergeStatement(cls_name, queries.connector)
+                    self.ast.add_to_last(merge)
         return_stmt = ReturnStatement(self.node_cls_detail, self.advanced_filter, without_return)
         self.ast.add_to_head(return_stmt)
 

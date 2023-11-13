@@ -112,7 +112,7 @@ if __name__ == '__main__':
 
     print()
 
-    a = Image.filter(tag=Tag.filter(name__startswith='d')) & Image.filter(size__gte=30)
+    a = Image.filter(tag=Tag.filter(name__startswith='d')) | Image.filter(size__gte=30)
     # Order by a property of the current node, DESC
     a = a.order_by('-size')
     # or order by multiple properties at once
@@ -132,4 +132,3 @@ if __name__ == '__main__':
 
     a = Image.filter(next_img=Image.filter(next_img__hash_code='a'), prev_img__tag__name='dog')
     print(a.cypher_query)
-    print()
