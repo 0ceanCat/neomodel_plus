@@ -2,7 +2,6 @@ import datetime
 import inspect
 from collections import defaultdict
 from io import StringIO
-from typing import TypeVar
 
 import django
 from django.db.models import Aggregate
@@ -48,7 +47,7 @@ class KeywordArgument:
 
 
 class RelKeywordArgument:
-    def __init__(self, rel_path, keyword_argument):
+    def __init__(self, rel_path: "RelPath", keyword_argument: KeywordArgument):
         self.rel_path = rel_path
         self.keyword_argument = keyword_argument
 
@@ -68,6 +67,12 @@ class RelPath:
         self.node_name = node_name
         self.rel_type = rel_type
         self.rel_direction = rel_direction
+        self.left = self.right = '-'
+        to = rel_direction == 1
+        if to:
+            self.right = '->'
+        else:
+            self.left = '<-'
         self.cls = cls
 
     def __repr__(self):
@@ -164,17 +169,21 @@ class _OPERATORS_CLASS:
         return self._OPERATORS.get(key, None) is not None
 
 
+OPERATORS = _OPERATORS_CLASS()
+
+
 class CypherKeyWords:
     class KeyWord:
-        def __init__(self, name):
+        def __init__(self, name: str, alias=None):
             self.name = name
+            self.alias = alias
 
         def __eq__(self, other):
             if isinstance(other, str):
-                return other.lower() == self.name.lower()
+                return other == self.name or other in self.alias
 
             elif isinstance(other, CypherKeyWords.KeyWord):
-                return other.name == self.name
+                return id(other) == id(self)
 
             return False
 
@@ -188,9 +197,9 @@ class CypherKeyWords:
     MATCH = KeyWord(name="MATCH")
     WHERE = KeyWord(name="WHERE")
     WITH = KeyWord(name="WITH")
-    AND = KeyWord(name="AND")
+    AND = KeyWord(name="AND", alias={"and"})
     NOT = KeyWord(name="NOT")
-    OR = KeyWord(name="OR")
+    OR = KeyWord(name="OR", alias={"or"})
     UNION = KeyWord(name="UNION")
     DISTINCT = KeyWord(name="DISTINCT")
     ORDER_BY = KeyWord(name="ORDER BY")
@@ -199,86 +208,562 @@ class CypherKeyWords:
 
 
 class Variable:
-    def __init__(self, newly_created, name):
+    def __init__(self, newly_created, name, flush=False):
         self.newly_created = newly_created
         self.name = name
+        self.flush = flush
+
+    def __str__(self):
+        return f'newly_created: {self.newly_created}, name: {self.name}, flush: {self.flush}'
+
+    def __repr__(self):
+        return str(self)
 
 
-OPERATORS = _OPERATORS_CLASS()
+class ASTTree:
+    def __init__(self, root: "Statement" = None):
+        self.root: "Statement" = root if root else Statement(None)
+        self.leaf: "Statement" = self.root
+
+    def add_to_last(self, stmt: "Statement"):
+        self.leaf.child = stmt
+        self.leaf = stmt
+
+    def add_to_head(self, stmt: "Statement"):
+        temp = self.root.child
+        stmt.child = temp
+        self.root.child = stmt
+
+    def get_cypher(self):
+        return self.root.get_cypher().cypher
+
+    def get_var(self, key):
+        return self.root._get_var(key)
+
+    def get_type_counter(self, type):
+        return self.root._get_type_counter(type)
 
 
-def remove_duplication(params):
-    r = []
-    for i in params:
-        if i not in r:
-            r.append(i)
-    return r
+class Statement:
+    def __init__(self, node, counter=0):
+        self.variable_name = None
+        self.parent = None
+        self.child = None
+        self._node = node
+        self._counter = counter
+        self._variable_table = {}
+        self._type_counter = defaultdict(int)
+
+    def get_cypher(self, parent: "Statement" = None) -> "StatementResult":
+        parent = parent if parent else self
+        if self.child:
+            return self.child.get_cypher(parent)
+        return StatementResult("", None)
+
+    def _next_var(self, key):
+        if self.parent:
+            return self.parent._next_var(key)
+        else:
+            """
+            create a variable for the given key
+            """
+            variable = self._variable_table.get(key)
+            if not variable:
+                variable = Variable(True, f"var_{key}_{self._get_type_counter(key)}")
+                self._variable_table[key] = variable
+            else:
+                if variable.flush:
+                    self._update_type_counter(key)
+                    self._variable_table[key] = None
+                variable.newly_created = False
+            return variable
+
+    def _get_var(self, key):
+        if self.parent:
+            return self.parent._get_var(key)
+        else:
+            return self._variable_table.get(key)
+
+    def _clear_variable_table(self, clear_all=True):
+        if self.parent:
+            self.parent._clear_variable_table()
+        else:
+            if clear_all:
+                self._variable_table.clear()
+            else:
+                self._variable_table = {
+                    self._node: self._variable_table[self._node]}
+
+    def _get_type_counter(self, type):
+        if self.parent:
+            return self.parent._get_type_counter(type)
+        else:
+            c = self._type_counter[type]
+            if c == 0:
+                c = self._counter
+            self._type_counter[type] = c
+            return c
+
+    def _update_type_counter(self, type, newV=None):
+        if self.parent:
+            return self.parent._update_type_counter(type, newV)
+        else:
+            if newV is not None:
+                self._type_counter[type] = max(newV, self._type_counter[type])
+            else:
+                c = self._get_type_counter(type)
+                c += 1
+                self._type_counter[type] = c
+                return c
+
+    def _update_variable_table(self, node_type, new_var):
+        if self.parent:
+            self.parent._update_variable_table(node_type, new_var)
+        else:
+            self._variable_table[node_type] = new_var
+
+    def _need_reflush(self, node_type):
+        if self.parent:
+            self.parent._need_reflush(node_type)
+        else:
+            variable = self._variable_table[node_type]
+            self._variable_table[node_type] = Variable(False, variable.name, flush=True)
+
+
+class Query(Statement):
+    def __init__(self, node, parent: "Statement" = None):
+        super().__init__(node)
+        if parent:
+            self.return_var = parent._get_var(node)
+
+
+class RecursiveStatement(Statement):
+    def __init__(self, rel_kw: "RelKeywordArgument", parent_filter_cls=None):
+        super().__init__(None)
+        self.rel_kw = rel_kw
+        self.parent_filter_cls = parent_filter_cls
+
+    def get_cypher(self, parent: "Statement" = None):
+        self.parent = parent
+        adv_filter = self.rel_kw.keyword_argument.value
+        node_name = adv_filter.cls.__name__
+        c = self._update_type_counter(type=node_name)
+        result = QueryBuilder(adv_filter)._build_query(without_return=True, counter=c)
+        self._update_type_counter(type=node_name, newV=result.type_counter + 1)
+        new_node_name = f'{node_name}_{result.type_counter}'
+        self._update_variable_table(new_node_name, Variable(False, result.returned_var))
+        self.rel_kw.rel_path.node_name = new_node_name
+
+        if self.child:
+            child_result = self.child.get_cypher(parent)
+            return StatementResult(f'{result.cypher}{child_result.cypher}', child_result.returned_var)
+        filter_result = QueryBuilder(adv_filter)._build_query(without_return=True)
+        return StatementResult(f'{filter_result.cypher}', self._get_var(node_name))
+
+
+class MergeStatement(Statement):
+    def __init__(self, node, connector: CypherKeyWords.KeyWord):
+        super().__init__(node)
+        self.connector = connector
+
+    def get_cypher(self, parent: "Statement" = None):
+        self.parent = parent
+        if self.child:
+            return StatementResult(f'{self._get_cypher().cypher}{self.child.get_cypher(parent).cypher}', None)
+        return StatementResult(self._get_cypher().cypher, None)
+
+    def _get_cypher(self):
+        cypher = ''
+        # if there are more queries, add the keyword UNION if the connector is OR
+        if self.connector == CypherKeyWords.OR:
+            cypher = f'{CypherKeyWords.RETURN} {self._next_var(self._node).name}\n{CypherKeyWords.UNION}\n'
+            self._clear_variable_table()
+        elif self.connector == CypherKeyWords.AND:
+            cypher = f'{CypherKeyWords.WITH} {self._next_var(self._node).name}\n'
+            self._clear_variable_table(False)
+        return StatementResult(cypher, None)
+
+
+class MatchStatement(Statement):
+    def __init__(self, node: str):
+        super().__init__(node)
+        self.variable_name = None
+        self.child = None
+
+    def get_cypher(self, parent: "Statement" = None) -> "StatementResult":
+        self.parent = parent
+        if self.child:
+            result = self._get_cypher()
+            child_result = self.child.get_cypher(parent)
+            return StatementResult(result.cypher + ' ' + child_result.cypher, result.returned_var)
+        else:
+            return self._get_cypher()
+
+    def _get_cypher(self):
+        variable = self._next_var(self._node)
+        self.variable_name = variable.name
+        if variable.newly_created:
+            stmt = f'{CypherKeyWords.MATCH} ({variable.name}:{self._node})'
+        else:
+            stmt = f'{CypherKeyWords.MATCH} ({variable.name})'
+        return StatementResult(stmt, variable.name)
+
+
+class RelationStatement(Statement):
+    def __init__(self, start_node, relationship_def: RelKeywordArgument):
+        super().__init__(start_node)
+        self.relationship_def = relationship_def
+        kw = relationship_def.keyword_argument
+        self.match_stmt = MatchStatement(start_node)
+        self.search_type = kw.type
+        if kw.type == SearchType.REL_PROP:
+            self.where_stmt = WhereStatement(relationship_def.rel_path.rel_type,
+                                             AttributeConditions([relationship_def]))
+        else:
+            self.where_stmt = WhereStatement(relationship_def.rel_path.rel_type, AttributeConditions())
+
+    def get_cypher(self, parent: "Statement" = None):
+        self.parent = parent
+        result = self._get_cypher()
+        if self.search_type != SearchType.REL_PROP:
+            where_cypher = "\n"
+        elif self.search_type == SearchType.REL_PROP:
+            where_cypher = self.where_stmt.get_cypher(parent).cypher
+        else:
+            where_cypher = ""
+
+        if self.child:
+            child_result = self.child.get_cypher(parent)
+            return StatementResult(f'{result.cypher} {where_cypher}{child_result.cypher}', result.returned_var)
+        return StatementResult(result.cypher + ' ' + where_cypher, result.returned_var)
+
+    def _get_cypher(self):
+        rel_path = self.relationship_def.rel_path
+        rel_node_name = rel_path.node_name
+        rel_variable = self._next_var(rel_path.rel_type)
+
+        connected_node_variable = self._next_var(rel_node_name)
+        if connected_node_variable.newly_created:
+            # if this variable has already been created
+            rel_stmt = self._write_relationship_stmt(rel_path, rel_variable.name,
+                                                     connected_node_variable.name, declare=True)
+        else:
+            rel_stmt = self._write_relationship_stmt(rel_path, rel_variable.name,
+                                                     connected_node_variable.name)
+
+        match_result = self.match_stmt.get_cypher(self.parent)
+        return StatementResult(match_result.cypher + rel_stmt, match_result.returned_var)
+
+    def _write_relationship_stmt(self, rel_def: RelPath, rel_variable_name, connected_node_variable_name,
+                                 declare=False):
+        if declare:
+            return f"{rel_def.left}[{rel_variable_name}:`{rel_def.rel_type}`]{rel_def.right}({connected_node_variable_name}:{rel_def.node_name})"
+        else:
+            return f"{rel_def.left}[{rel_variable_name}:`{rel_def.rel_type}`]{rel_def.right}({connected_node_variable_name})"
+
+
+class WhereStatement(Statement):
+    def __init__(self, node, where_conditions: "AttributeConditions"):
+        super().__init__(node)
+        self.node = node
+        self.where_conditions = where_conditions
+        self.cypher = StringIO()
+
+    def get_cypher(self, parent: "Statement" = None):
+        self.parent = parent
+        variable = self._next_var(self.node)
+        if self.where_conditions.degree() > 0:
+            self._write(CypherKeyWords.WHERE.name, space=True)
+
+        self._write_where_stmt(StructuredNode, self.where_conditions.and_conditions, CypherKeyWords.AND,
+                               variable.name)
+
+        if self.where_conditions.degree() > 1:
+            self._add_merge_key_word(CypherKeyWords.AND)
+
+        self._write_where_stmt(StructuredNode, self.where_conditions.or_conditions, CypherKeyWords.OR,
+                               variable.name)
+
+        cypher = self.cypher.getvalue()
+        if cypher:
+            cypher += '\n'
+
+        if self.child:
+            child_result = self.child.get_cypher(parent)
+            return StatementResult(cypher + child_result.cypher, child_result.returned_var)
+        else:
+            return StatementResult(cypher, None)
+
+    def _write_where_stmt(self, target_type: type, condition_list: list, connector: CypherKeyWords.KeyWord, var: str,
+                          continuation: bool = False):
+        """
+        Write where statement for the current MATCH query
+        """
+        if not condition_list:
+            return
+
+        if connector == CypherKeyWords.OR and len(condition_list) > 1:
+            self._write('(')
+
+        self._write_property_filters(condition_list, connector, target_type, var)
+
+        if connector == CypherKeyWords.OR and len(condition_list) > 1:
+            self._write(') ')
+
+    def _write_property_filters(self, condition_list: list, connector: CypherKeyWords.KeyWord, target_type: type,
+                                var: str):
+        for j, condition in enumerate(condition_list):
+            if isinstance(condition, RelKeywordArgument):
+                rel_path, condition = condition
+
+            negated, param, operator, v, type = condition
+            not_ = CypherKeyWords.NOT + ' ' if negated else ''
+
+            if type == SearchType.ID:
+                if is_collection(v):
+                    self._write_id_stmt(not_, var, operator, _convert_nodes_to_ids(target_type, v))
+                else:
+                    _check_type(v, target_type)
+                    v = _to_id(v)
+                    self._write_id_stmt(not_, var, OPERATORS.EQ, v)
+
+            elif type == SearchType.REL_PROP:
+                rel_type = rel_path.rel_type
+                self._write_value_stmt(not_, self._next_var(rel_type).name, param, operator,
+                                       _change_if_v_not_adequate(v))
+            else:
+                if operator == OPERATORS.IN and not isinstance(v, list):
+                    v = list(v) if isinstance(v, tuple) else [v]
+
+                self._write_value_stmt(not_, var, param, operator, _change_if_v_not_adequate(v))
+
+            if j + 1 < len(condition_list):
+                self._add_merge_key_word(connector)
+
+    def _add_merge_key_word(self, connector: CypherKeyWords.KeyWord):
+        self._write(connector.name, space=True)
+
+    def _write(self, s, space=False):
+        if space:
+            self.cypher.write(s + ' ')
+        else:
+            self.cypher.write(s)
+
+    def _new_line(self):
+        self._write("\n")
+
+    def _write_id_stmt(self, negated: str, variable_name: str, operator: str, value: int):
+        self._write(f"{negated}ID({variable_name}) {operator} {value} ")
+
+    def _write_value_stmt(self, negated: str, variable_name: str, param: str, operator: str, value):
+        self._write(f"{negated}{variable_name}.{param} {operator} {value} ")
+
+
+class ReturnStatement(Statement):
+    def __init__(self, node_detail: NodeRelationshipDetail, filter: "AdvancedNodeSet", without_return=False):
+        super().__init__(node_detail.cls_name)
+        self.filter = filter
+        self.node_detail = node_detail
+        self.without_return = without_return
+        self.cypher = StringIO()
+
+    def get_cypher(self, parent: "Statement" = None):
+        self.parent = parent
+        child_result = self.child.get_cypher(parent)
+        result = self._get_cypher(child_result.returned_var)
+        return StatementResult(child_result.cypher + result.cypher, child_result.returned_var)
+
+    def _get_cypher(self, variable=None):
+        aggregate = self.filter._aggregate
+        if not self.without_return:
+            if variable is None:
+                variable = self._next_var(self._node).name
+            count_records = self.filter._count_records
+            orderby_params = self.filter._order_by
+
+            if not aggregate and not count_records:
+                orderby_params = self._create_orderby_params(variable, orderby_params)
+
+            self._write_return_stmt(variable, aggregate, count_records)
+
+            if not aggregate:
+                self._write_order_by_stmt(orderby_params)
+
+                self._write_skip_stmt()
+
+                self._write_limit_stmt()
+            self._write("\n")
+        return StatementResult(self.cypher.getvalue(), variable)
+
+    def _write(self, s, space=True):
+        if space:
+            self.cypher.write(s + ' ')
+        else:
+            self.cypher.write(s)
+
+    def _write_limit_stmt(self):
+        lmt = self.filter._limit
+        if lmt:
+            self._write(f"{CypherKeyWords.LIMIT} {lmt} ")
+
+    def _write_skip_stmt(self):
+        skp = self.filter._skip
+        if skp:
+            self._write(f"{CypherKeyWords.SKIP} {skp} ")
+
+    def _write_order_by_stmt(self, orderby_params):
+        if orderby_params:
+            orderby_stmt = ', '.join([f"{o[0]}.{o[1]} {o[2]}" for o in orderby_params])
+            self._write(f" {CypherKeyWords.ORDER_BY} {orderby_stmt}")
+
+    def _write_return_stmt(self, variable: str, aggregate: Aggregate, count=False):
+        if aggregate:
+            self._write(f' {CypherKeyWords.RETURN} {aggregate.name}({variable}.{aggregate.identity[1][1][0]})')
+            return
+
+        self._write_distinct_stmt(variable)
+
+        self._write(f' {CypherKeyWords.RETURN.name} ')
+
+        if count:
+            self._write(f' COUNT({variable})')
+        else:
+            select = self.filter._select
+            if select:
+                self._transform_select(select)
+                self._write_select_stmt(select, variable)
+            else:
+                self._write(variable)
+
+    def _transform_select(self, select):
+        for i, prop in enumerate(select):
+            if not self._check_if_current_node_property(prop):
+                if prop == 'id':
+                    select[i] = (True, prop)
+                else:
+                    raise AttributeError(
+                        f"{self.node_detail.cls_name} does not have property '{prop}'!")
+            else:
+                select[i] = (False, prop)
+
+    def _write_select_stmt(self, select: list, variable: str):
+        for i, prop in enumerate(select):
+            id_prop, prop = prop
+            if i > 0:
+                self._write(", ")
+
+            if id_prop:
+                self._write(f"ID({variable}) ")
+            else:
+                self._write(f"{variable}.{prop} ")
+
+    def _write_distinct_stmt(self, variable: str):
+        if self.filter._distinct:
+            self._write(f"{CypherKeyWords.WITH} {CypherKeyWords.DISTINCT} {variable} ")
+
+    def _create_orderby_params(self, cls_var, odby):
+        orderby_params = []
+
+        # verify if order_by properties belong to the current node or to some node directly connected with it
+        for o in odby:
+            prop, order = o
+            is_current_node_property = self._check_if_current_node_property(prop)
+
+            # check if is a property of a directly connected node
+            is_directly_connected_node_property = self._check_if_connected_node_property(self.node_detail.cls, prop)
+
+            if not is_current_node_property and not is_directly_connected_node_property and prop != 'id':
+                raise AttributeError(
+                    f"{self.node_detail.cls_name} does not have property '{prop}'!")
+
+            orderby_params.append((cls_var, prop, order))
+
+        return orderby_params
+
+    def _check_if_current_node_property(self, prop_name):
+        return self.node_detail.is_node_property(prop_name)
+
+    def _check_if_connected_node_property(self, clzz, prop_name):
+        self.node_detail.get_linkedNode_cls(clzz.__name__)
+        directly_connected_node = _get_node_detail(clzz)
+        return directly_connected_node.is_node_property(prop_name)
+
+
+class Conditions:
+    def __init__(self, and_conditions, or_conditions):
+        self.and_conditions = and_conditions
+        self.or_conditions = or_conditions
+
+    def __bool__(self):
+        return len(self.and_conditions) + len(self.or_conditions) > 0
+
+    def degree(self):
+        return int(bool(self.and_conditions)) + int(bool(self.or_conditions))
+
+
+class RelConditions(Conditions):
+    def __init__(self):
+        super().__init__(defaultdict(list), defaultdict(list))
+
+    def __bool__(self):
+        return len(self.and_conditions) + len(self.or_conditions) > 0
+
+    def degree(self):
+        return int(bool(self.and_conditions)) + int(bool(self.or_conditions))
+
+    def add(self, key, value, AND=True):
+        if AND:
+            self.and_conditions[key].append(value)
+        else:
+            self.or_conditions[key].append(value)
+
+    def extend(self, key, list_, AND=True):
+        if AND:
+            self.and_conditions[key].extend(list_)
+        else:
+            self.or_conditions[key].extend(list_)
+
+    def merge(self, rel_conditions: "RelConditions"):
+        def _merge(dictA, dictB):
+            for k in dictB.keys():
+                dictA[k].extend(dictB[k])
+
+        _merge(self.and_conditions, rel_conditions.and_conditions)
+        _merge(self.or_conditions, rel_conditions.or_conditions)
+
+
+class AttributeConditions(Conditions):
+    def __init__(self, and_conditions=None, or_conditions=None):
+        super().__init__(and_conditions, or_conditions)
+        if or_conditions is None:
+            self.or_conditions = []
+        if and_conditions is None:
+            self.and_conditions = []
+
+    def __getitem__(self, item):
+        if item == CypherKeyWords.AND:
+            return self.and_conditions
+        return self.or_conditions
+
+    def add(self, value, AND=True):
+        if AND:
+            self.and_conditions.append(value)
+        else:
+            self.or_conditions.append(value)
+
+    def merge(self, attr_conditions: "AttributeConditions"):
+        self.and_conditions.extend(attr_conditions.and_conditions)
+        self.or_conditions.extend(attr_conditions.or_conditions)
 
 
 class AttributeRelConditions:
-    class RelConditions:
-        def __init__(self, ):
-            self.and_rel_conditions = defaultdict(list)
-            self.or_rel_conditions = defaultdict(list)
-
-        def __bool__(self):
-            return len(self.and_rel_conditions) + len(self.or_rel_conditions) > 0
-
-        def gree(self):
-            return int(bool(self.and_rel_conditions)) + int(bool(self.or_rel_conditions))
-
-        def add(self, key, value, AND=True):
-            if AND:
-                self.and_rel_conditions[key].append(value)
-            else:
-                self.or_rel_conditions[key].append(value)
-
-        def extend(self, key, list_, AND=True):
-            if AND:
-                self.and_rel_conditions[key].extend(list_)
-            else:
-                self.or_rel_conditions[key].extend(list_)
-
-        def merge(self, rel_conditions):
-            def _merge(dictA, dictB):
-                for k in dictB.keys():
-                    dictA[k].extend(dictB[k])
-
-            _merge(self.and_rel_conditions, rel_conditions.and_rel_conditions)
-            _merge(self.or_rel_conditions, rel_conditions.or_rel_conditions)
-
-    class AttributeConditions:
-        def __init__(self):
-            self.and_attr_conditions = []
-            self.or_attr_conditions = []
-
-        def __getitem__(self, item):
-            if item == CypherKeyWords.AND:
-                return self.and_attr_conditions
-            return self.or_attr_conditions
-
-        def __bool__(self):
-            return len(self.and_attr_conditions) + len(self.or_attr_conditions) > 0
-
-        def gree(self):
-            return int(bool(self.and_attr_conditions)) + int(bool(self.or_attr_conditions))
-
-        def add(self, value, AND=True):
-            if AND:
-                self.and_attr_conditions.append(value)
-            else:
-                self.or_attr_conditions.append(value)
-
-        def merge(self, attr_conditions):
-            self.and_attr_conditions.extend(attr_conditions.and_attr_conditions)
-            self.or_attr_conditions.extend(attr_conditions.or_attr_conditions)
 
     def __init__(self):
         # attribute conditions for the current Node
-        self.rel_conditions = AttributeRelConditions.RelConditions()
+        self.rel_conditions = RelConditions()
 
         # relationships directly used by the current Node
-        self.attr_conditions = AttributeRelConditions.AttributeConditions()
+        self.attr_conditions = AttributeConditions()
 
     def merge(self, conditions):
         self.rel_conditions.merge(conditions.rel_conditions)
@@ -296,9 +781,10 @@ class QueryParser:
         self.node_cls_detail = node_cls_detail
 
     def parse_param_list(self, connector, param_list, negated=False):
-        conditions = AttributeRelConditions()
         param_list = remove_duplication(param_list)
         is_AND = connector == CypherKeyWords.AND
+        conditions = AttributeRelConditions()
+
         for param_v in param_list:
             if isinstance(param_v, Q):
                 conditions.merge(self.parse_param_list(param_v.connector, param_v.children, param_v.negated))
@@ -335,30 +821,127 @@ class QueryParser:
                     # The relationship that connects the current node and Tag node has property `quantity` >= 10
                     operator = OPERATORS[split_param[2]]
 
-                conditions.add_rel_condition(split_param[0][4:], KeywordArgument(negated, split_param[1], operator, v,
-                                                                                 type=SearchType.REL_PROP), is_AND)
+                rel_kwarg = self._convert_rel_condition_to_argument(split_param[0][4:],
+                                                                    KeywordArgument(negated, split_param[1], operator,
+                                                                                    v,
+                                                                                    type=SearchType.REL_PROP))
+                conditions.add_rel_condition(split_param[0][4:], rel_kwarg, is_AND)
             else:
                 # relationship search
                 if len(split_param) == 1:
                     if isinstance(v, AdvancedNodeSet):
-                        # e.g: Image.filter(tag=Tag.filter(name='a'))
-                        # where `tag` is a declared property in Image class that represents the relationship between Image and Tag
-                        conditions.add_rel_condition(split_param[0],
-                                                     KeywordArgument(negated, None, operator, v,
-                                                                     type=SearchType.RECUR_NSET), is_AND)
+                        # e.g: Image.filter(tag=Tag.filter(name='a')) where `tag` is a declared property in Image
+                        # class that represents the relationship between Image and Tag
+                        rel_kwarg = self._convert_rel_condition_to_argument(split_param[0],
+                                                                            KeywordArgument(negated, None, operator, v,
+                                                                                            type=SearchType.RECUR_NSET))
 
                     else:
                         # e.g: Image.filter(tag=Tag())
-                        conditions.add_rel_condition(split_param[0],
-                                                     KeywordArgument(negated, None, operator, v, type=SearchType.ID),
-                                                     is_AND)
-
+                        rel_kwarg = self._convert_rel_condition_to_argument(split_param[0],
+                                                                            KeywordArgument(negated, None, operator, v,
+                                                                                            type=SearchType.ID))
                 else:
                     # e.g: Image.filter(tag__name__startswith='a')
-                    conditions.add_rel_condition(split_param[0],
-                                                 KeywordArgument(negated, f"{'__'.join(split_param[1:])}", operator, v,
-                                                                 type=SearchType.RECUR_PROP), is_AND)
+                    rel_kwarg = self._convert_rel_condition_to_argument(split_param[0],
+                                                                        KeywordArgument(negated,
+                                                                                        f"{'__'.join(split_param[1:])}",
+                                                                                        operator, v,
+                                                                                        type=SearchType.RECUR_PROP))
+                conditions.add_rel_condition(split_param[0], rel_kwarg, is_AND)
         return conditions
+
+    def _convert_rel_condition_to_argument(self, connected_node_name, kwarg: KeywordArgument):
+        rel_kwarg = None
+        param, v, type = kwarg.parameter, kwarg.value, kwarg.type
+        if type != SearchType.ID and not self.node_cls_detail.is_node_relationship(connected_node_name):
+            if type == SearchType.RECUR_NSET:
+                # There is no defined relationship between Image and Tag in the class Image
+                # But we have the relationship declared in the class Tag
+                # So we can do something like: Image.filter(tag=Tag.filter(name='abc'))
+                detail = _get_node_detail(v.cls)
+                if detail.is_connected_with(self.node_cls_detail.cls):
+                    rel_path = detail.get_rel_detail(self.node_cls_detail.cls_name, inverse=True)
+                    rel_kwarg = RelKeywordArgument(rel_path, kwarg)
+                else:
+                    raise ValueError(
+                        f"There is no connection between {self.node_cls_detail.cls_name} and {v.cls.__name__}")
+            else:
+                # e.g: Image.filter(tag__name='a')
+                # e.g: Image.filter(tag=Q(name='a'))
+                # Note that, Image does not have any property called `tag`,
+                # but we know that the relationship between Image and tag is declared in the class Tag.
+                # So we can use Tag class' name as a property.
+                try:
+                    connected_class = str_to_class(connected_node_name)
+                    detail = _get_node_detail(connected_class)
+                    if detail.is_connected_with(self.node_cls_detail.cls):
+                        rel_path = detail.get_rel_detail(self.node_cls_detail.cls_name, inverse=True)
+                        if type in (SearchType.ID, SearchType.REL_PROP):
+                            # e.g: Image.filter(tag=Tag())
+                            rel_kwarg = RelKeywordArgument(rel_path, kwarg)
+                        else:
+                            # type == SearchType.RECUR_PROP
+                            # e.g: Image.filter(tag__name='a')
+                            rel_kwarg = RelKeywordArgument(rel_path,
+                                                           KeywordArgument(kwarg.negated,
+                                                                           kwarg.parameter,
+                                                                           kwarg.operator,
+                                                                           detail.cls.filter(
+                                                                               **{param: v})))
+                    else:
+                        self._no_property_error(connected_node_name)
+                except KeyError:
+                    self._no_property_error(connected_node_name)
+
+        else:
+            rel_path = self.node_cls_detail.get_rel_detail(connected_node_name)
+            if type == SearchType.RECUR_PROP:
+                # need to be recursively processed
+                rel_kwarg = RelKeywordArgument(rel_path,
+                                               KeywordArgument(kwarg.negated, kwarg.parameter,
+                                                               kwarg.operator,
+                                                               rel_path.cls.filter(**{param: v})))
+            else:
+                # type == SearchType.RECUR_NSET
+                rel_kwarg = RelKeywordArgument(rel_path, kwarg)
+
+        return rel_kwarg
+
+    def _no_property_error(self, rel):
+        raise ValueError(
+            f"There is no property or connected Node called {rel} in {self.node_cls_detail.cls_name}")
+
+
+class StatementBuilder:
+    def convert_params_to_statements(self, ast: ASTTree, node_name, conditions: AttributeRelConditions):
+
+        if conditions.attr_conditions.degree() > 0:
+            statement = MatchStatement(node_name)
+            ast.add_to_last(statement)
+            where_stmt = WhereStatement(node_name, conditions.attr_conditions)
+            ast.add_to_last(where_stmt)
+
+        def _rel_stmt(conditions, connector):
+            for key in conditions:
+                for i, value in enumerate(conditions[key]):
+                    value: RelKeywordArgument = value
+                    if isinstance(value.keyword_argument.value, AdvancedNodeSet):
+                        stmt = RecursiveStatement(value)
+                        ast.add_to_last(stmt)
+                    stmt = RelationStatement(node_name, value)
+                    ast.add_to_last(stmt)
+
+                    if i + 1 < len(conditions[key]):
+                        merge = MergeStatement(node_name, connector)
+                        ast.add_to_last(merge)
+
+        _rel_stmt(conditions.rel_conditions.and_conditions, CypherKeyWords.AND)
+        _rel_stmt(conditions.rel_conditions.or_conditions, CypherKeyWords.OR)
+
+        if conditions.attr_conditions.degree() == 0 and not isinstance(ast.leaf, RelationStatement):
+            # if there is no where statement for the current node, we can place the match statement at the end
+            ast.add_to_last(MatchStatement(node_name))
 
 
 class QueryBuilderResult:
@@ -368,37 +951,97 @@ class QueryBuilderResult:
         self.type_counter = type_counter
 
 
+class StatementResult:
+    def __init__(self, cypher, returned_var):
+        self.cypher = cypher
+        self.returned_var = returned_var
+
+
 def _space(space):
     return " " if space else ""
 
 
-class QueryBuilder:
-    VAR_COUNTER = 0
-    NODE_DETAILS = {}
+def _convert_nodes_to_ids(target_type, nodes):
+    """
+    convert a list of nodes to a list of ids
+    """
+    check = _check_type
 
+    if is_collection(nodes):
+        if nodes:
+            return [_to_id(e) for e in nodes if check(e, target_type)]
+        raise ValueError("Empty collection detected")
+    return nodes
+
+
+def _to_id(e):
+    if isinstance(e, int):
+        return e
+    else:
+        return e.id
+
+
+def _check_type(given_obj, target_type):
+    """
+    check type of given object
+    """
+    if not isinstance(given_obj, StructuredNode) and \
+            not isinstance(given_obj, target_type) and \
+            not isinstance(given_obj, int):
+        raise ValueError(f"Invalid ID values!")
+
+    return True
+
+
+def _change_if_v_not_adequate(v):
+    if isinstance(v, str):
+        return f"'{v}'"
+    if isinstance(v, datetime.datetime):
+        return v.timestamp()
+    elif isinstance(v, datetime.date):
+        return f"'{str(v)}'"
+    return v
+
+
+def remove_duplication(params):
+    r = []
+    for i in params:
+        if i not in r:
+            r.append(i)
+    return r
+
+
+NODE_DETAILS = {}
+
+
+def _get_node_detail(clazz: type):
+    details = NODE_DETAILS.get(clazz.__name__)
+    if details is None:
+        details = NodeRelationshipDetail(clazz)
+        NODE_DETAILS[clazz.__name__] = details
+    return details
+
+
+class QueryBuilder:
     def __init__(self, advanced_filter):
         self.advanced_filter = advanced_filter
-        self.node_cls_detail = self._get_node_detail(advanced_filter.cls)
-        self.variable_table = defaultdict(str)
-        self.type_counter = defaultdict(int)
-        self.query_builder = StringIO()
+        self.node_cls_detail = _get_node_detail(advanced_filter.cls)
         self.parser = QueryParser(self.node_cls_detail)
+        self.statement_builder = StatementBuilder()
 
     def _build_query(self, without_return=False, counter=0):
-        self.counter = counter
+        self.ast = ASTTree(Statement(self.node_cls_detail.cls_name, counter=counter))
         queries = self.advanced_filter._filter
         cls_name = self.node_cls_detail.cls_name
         if len(queries.children) == 0:
             # when user passes an empty Q, e.g: Image.filter(Q())
-            variable = self._get_var(cls_name)
-            self._write(f"{CypherKeyWords.MATCH} ({variable.name}:{cls_name}) ")
+            self.ast.add_to_last(MatchStatement(cls_name))
         else:
 
             # e.g: query_1 = Q(age=1), query_2 = Q(name_startswith='d')
             # c = query_1 & query_2. In this case, the connector between the queries is 'AND'
             # c = query_1 | query_2. The connector between the queries is 'OR'
             # if convert these queries to cypher, they will be a combination of MATCH queries
-            inter_query_connector = queries.connector
             children = [e for e in queries.children if not isinstance(e, tuple)]
             children.extend([e for e in queries.children if isinstance(e, tuple)])
             children = remove_duplication(children)
@@ -421,499 +1064,19 @@ class QueryBuilder:
 
                 if len(param_list) == 0:
                     # when user passes an empty Q, e.g: Image.filter(Q())
-                    variable = self._get_var(cls_name)
-                    self._write_match_stmt(variable.name, cls_name)
+                    self.ast.add_to_last(MatchStatement(cls_name))
                 else:
                     conditions = self.parser.parse_param_list(inter_param_connector, param_list,
                                                               negated)
-                    self._make_basic_cypher(conditions.attr_conditions)
+                    self.statement_builder.convert_params_to_statements(self.ast,
+                                                                        cls_name,
+                                                                        conditions)
+        return_stmt = ReturnStatement(self.node_cls_detail, self.advanced_filter, without_return)
+        self.ast.add_to_head(return_stmt)
 
-                    self._make_cypher_for_rels(conditions.rel_conditions)
-
-                    self._add_merge_key_word(i, len(queries.children), inter_query_connector)
-                    self._new_line()
-
-        self._terminal_stmt(without_return)
-        result = QueryBuilderResult(self.query_builder.getvalue(), self._get_var(cls_name).name,
-                                    self._get_type_counter(self.node_cls_detail.cls))
+        result = QueryBuilderResult(self.ast.get_cypher(), self.ast.get_var(cls_name).name,
+                                    self.ast.get_type_counter(cls_name))
         return result
-
-    def _terminal_stmt(self, without_return):
-        cls_name = self.node_cls_detail.cls_name
-
-        aggregate = self.advanced_filter._aggregate
-        if not without_return:
-            variable = self._get_var(cls_name)
-            count_records = self.advanced_filter._count_records
-            orderby_params = self.advanced_filter._order_by
-
-            if not aggregate and not count_records:
-                orderby_params = self._create_orderby_params(variable.name, orderby_params)
-
-            self._write_return_stmt(variable.name, aggregate, count_records)
-
-            if not aggregate:
-                self._write_order_by_stmt(orderby_params)
-
-                self._write_skip_stmt()
-
-                self._write_limit_stmt()
-
-    def _create_orderby_params(self, cls_var, odby):
-        orderby_params = []
-
-        # verify if order_by properties belong to the current node or to some node directly connected with it
-        for o in odby:
-            prop, order = o
-            is_current_node_property = self._check_if_current_node_property(prop)
-
-            # check if is a property of a directly connected node
-            is_directly_connected_node_property = self._check_if_connected_node_property(self.node_cls_detail.cls, prop)
-
-            if not is_current_node_property and not is_directly_connected_node_property and prop != 'id':
-                raise AttributeError(
-                    f"{self.node_cls_detail.cls_name} does not have property '{prop}'!")
-
-            orderby_params.append((cls_var, prop, order))
-
-        return orderby_params
-
-    def _check_if_current_node_property(self, prop_name):
-        return self.node_cls_detail.is_node_property(prop_name)
-
-    def _check_if_connected_node_property(self, clzz, prop_name):
-        self.node_cls_detail.get_linkedNode_cls(clzz.__name__)
-        directly_connected_node = self._get_node_detail(clzz)
-        return directly_connected_node.is_node_property(prop_name)
-
-    def _change_if_v_not_adequate(self, v):
-        if isinstance(v, str):
-            return f"'{v}'"
-        if isinstance(v, datetime.datetime):
-            return v.timestamp()
-        elif isinstance(v, datetime.date):
-            return f"'{str(v)}'"
-        return v
-
-    def _add_merge_key_word(self, i: int, list_len: int, connector: CypherKeyWords.KeyWord,
-                            condition_filter: bool = False):
-        cls = self.advanced_filter.cls
-        if i + 1 < list_len:
-            # if there are more queries, add the keyword UNION if the connector is OR
-            if condition_filter:
-                self._write(connector, space=True)
-            elif connector == CypherKeyWords.OR:
-                self._new_line()
-                self._write(f'{CypherKeyWords.RETURN} {self._get_var(cls.__name__).name}')
-                self._new_line()
-                self._write(CypherKeyWords.UNION)
-                self._new_line()
-                self._clear_variable_table()
-            elif connector == CypherKeyWords.AND:
-                self._new_line()
-                self._write(f"{CypherKeyWords.WITH} {self._get_var(cls.__name__).name} ")
-                self._clear_variable_table(False)
-
-    def _make_basic_cypher(self, attr_conditions: AttributeRelConditions.AttributeConditions):
-        """
-        e.g: MATCH (n:Node)
-        """
-        if not attr_conditions:
-            return
-
-        cls_name = self.node_cls_detail.cls_name
-        variable = self._get_var(cls_name)
-
-        # if the current node type was never used, declare a new variable
-        # ex: MATCH (varA: Image)
-        # if the current node type has been used, use the declared variable
-        # ex: MATCH (varA)
-        self._write_match_stmt(variable.name, cls_name if not variable.newly_created else None)
-
-        self._write_where_stmt(self.node_cls_detail.cls, attr_conditions.and_attr_conditions, CypherKeyWords.AND,
-                               variable.name, False)
-
-        self._add_merge_key_word(0, attr_conditions.gree(), CypherKeyWords.AND, condition_filter=True)
-
-        self._write_where_stmt(self.node_cls_detail.cls, attr_conditions.or_attr_conditions, CypherKeyWords.OR,
-                               variable.name, True)
-
-    def _write_property_filters(self, condition_list: list, connector: CypherKeyWords.KeyWord, target_type: type,
-                                var: str):
-        for j, condition in enumerate(condition_list):
-            if isinstance(condition, RelKeywordArgument):
-                rel_path, condition = condition
-
-            negated, param, operator, v, type = condition
-            not_ = CypherKeyWords.NOT if negated else ''
-
-            if type == SearchType.ID:
-                if is_collection(v):
-                    self._write_id_stmt(not_, var, operator, self._convert_nodes_to_ids(target_type, v))
-                else:
-                    self._check_type(v, target_type)
-                    v = self._to_id(v)
-                    self._write_id_stmt(not_, var, OPERATORS.EQ, v)
-
-            elif type == SearchType.REL_PROP:
-                rel_type = rel_path.rel_type
-                self._write_value_stmt(not_, self._get_var(rel_type).name, param, operator,
-                                       self._change_if_v_not_adequate(v))
-            else:
-                if operator == OPERATORS.IN and not isinstance(v, list):
-                    v = list(v) if isinstance(v, tuple) else [v]
-
-                self._write_value_stmt(not_, var, param, operator, self._change_if_v_not_adequate(v))
-
-            self._add_merge_key_word(j, len(condition_list), connector, condition_filter=True)
-
-    def _make_rel_cypher(self, rel_node_name, rel_type, rel_direction, continuation=False):
-        """
-        make a relationship path with the current node
-        and return the used variable
-        e.g: `MATCH (a)-[b]-(c)`
-        """
-
-        connected_node_variable = self._get_var(rel_node_name)
-        connected_node_var = connected_node_variable.name
-        to = rel_direction == 1
-        left = right = '-'
-        if to:
-            right = '->'
-        else:
-            left = '<-'
-
-        rel_variable = self._get_var(rel_type)
-        rel_var = rel_variable.name
-
-        if continuation:
-            if connected_node_variable.newly_created:
-                self._write_basic_relationship_stmt(left, rel_var, rel_type, right, connected_node_var)
-            else:
-                self._write_basic_relationship_stmt(left, rel_var, rel_type, right, connected_node_var, rel_node_name)
-        else:
-            current_node_variable = self._get_var(self.node_cls_detail.cls_name)
-            current_node_var = current_node_variable.name
-
-            if current_node_variable.newly_created:
-                # if this variable has already been created
-                self._write_match_stmt(current_node_var, space=False)
-            else:
-                self._write_match_stmt(current_node_var, self.node_cls_detail.cls_name, space=False)
-
-            if connected_node_variable.newly_created:
-                # if this variable has already been created
-                self._write_basic_relationship_stmt(left, rel_var, rel_type, right, connected_node_var)
-            else:
-                self._write_basic_relationship_stmt(left, rel_var, rel_type, right, connected_node_var, rel_node_name)
-
-        return connected_node_var
-
-    def _make_cypher_for_rels(self, rel_conditions):
-        self._write_relationship_stmt(rel_conditions.and_rel_conditions, connector=CypherKeyWords.AND)
-        self._add_merge_key_word(0, rel_conditions.gree(), CypherKeyWords.AND)
-        self._write_relationship_stmt(rel_conditions.or_rel_conditions, connector=CypherKeyWords.OR)
-
-    def _write_relationship_stmt(self, condition_list: dict, connector):
-        rel_names = sorted(list(condition_list.keys()))
-        len_rel_names = len(rel_names)
-
-        for j in range(0, len_rel_names):
-            rel = rel_names[j]
-
-            self._convert_to_arguments(condition_list, rel)
-
-            filters = []
-
-            # process first the AdvancedNodeSet filters
-            for i, rel_keyword_argument in enumerate(condition_list[rel]):
-                rel_path: RelPath = rel_keyword_argument.rel_path
-                keyword_argument: KeywordArgument = rel_keyword_argument.keyword_argument
-
-                if isinstance(keyword_argument.value, AdvancedNodeSet):
-                    # parse the AdvancedNodeSet recursively
-                    rel_var = self._merge_additional_filter(keyword_argument.value)
-                    rel_path.node_name = f'{rel_path.node_name}_{self._get_type_counter(rel_path.cls)}'
-                    self._update_variable_table(rel_path.node_name, rel_var)
-                    filters.append(rel_keyword_argument)
-
-                self._make_rel_cypher(rel_path.node_name, rel_path.rel_type, rel_path.rel_direction)
-
-                self._add_merge_key_word(i, len(condition_list[rel]), connector)
-
-            # delete processed filters from the list
-            condition_list[rel] = [i for i in condition_list[rel] if i not in filters]
-
-            # then process the normal attribute filters
-            for rel_keyword_argument in condition_list[rel]:
-                rel_path: RelPath = rel_keyword_argument.rel_path
-                keyword_argument: KeywordArgument = rel_keyword_argument.keyword_argument
-
-                self._write_where_stmt(rel_path.cls, [RelKeywordArgument(rel_path, keyword_argument)], connector,
-                                       self._get_var(rel_path.node_name).name)
-                self._add_merge_key_word(j + 1, len_rel_names, connector)
-
-    def _convert_to_arguments(self, condition_list, rel):
-        for i in range(len(condition_list[rel])):
-            kargs = condition_list[rel][i]
-            param, v, type = kargs.parameter, kargs.value, kargs.type
-            if type != SearchType.ID and not self.node_cls_detail.is_node_relationship(rel):
-                if type == SearchType.RECUR_NSET:
-                    # There is no defined relationship between Image and Tag in the class Image
-                    # But we have the relationship declared in the class Tag
-                    # So we can do something like: Image.filter(tag=Tag.filter(name='abc'))
-                    detail = self._get_node_detail(v.cls)
-                    if detail.is_connected_with(self.node_cls_detail.cls):
-                        rel_path = detail.get_rel_detail(self.node_cls_detail.cls_name, inverse=True)
-                        condition_list[rel][i] = RelKeywordArgument(rel_path, kargs)
-                    else:
-                        raise ValueError(
-                            f"There is no connection between {self.node_cls_detail.cls_name} and {v.cls.__name__}")
-                else:
-                    # e.g: Image.filter(tag__name='a')
-                    # e.g: Image.filter(tag=Q(name='a'))
-                    # Note that, Image does not have any property called `tag`,
-                    # but we know that the relationship between Image and tag is declared in the class Tag.
-                    # So we can use Tag class' name as a property.
-                    try:
-                        connected_class = str_to_class(rel)
-                        detail = self._get_node_detail(connected_class)
-                        if detail.is_connected_with(self.node_cls_detail.cls):
-                            rel_path = detail.get_rel_detail(self.node_cls_detail.cls_name, inverse=True)
-                            if type in (SearchType.ID, SearchType.REL_PROP):
-                                # e.g: Image.filter(tag=Tag())
-                                condition_list[rel][i] = RelKeywordArgument(rel_path,
-                                                                            KeywordArgument(*condition_list[rel][i]))
-                            else:
-                                # type == SearchType.RECUR_PROP
-                                # e.g: Image.filter(tag__name='a')
-                                condition_list[rel][i] = RelKeywordArgument(rel_path,
-                                                                            KeywordArgument(kargs.negated,
-                                                                                            kargs.parameter,
-                                                                                            kargs.operator,
-                                                                                            detail.cls.filter(
-                                                                                                **{param: v})))
-                        else:
-                            self._no_property_error(rel)
-                    except KeyError:
-                        self._no_property_error(rel)
-
-            else:
-                rel_path = self.node_cls_detail.get_rel_detail(rel)
-                if type == SearchType.RECUR_PROP:
-                    # need to be recursively processed
-                    condition_list[rel][i] = RelKeywordArgument(rel_path,
-                                                                KeywordArgument(kargs.negated, kargs.parameter,
-                                                                                kargs.operator,
-                                                                                rel_path.cls.filter(**{param: v})))
-                else:
-                    # type == SearchType.RECUR_NSET
-                    condition_list[rel][i] = RelKeywordArgument(rel_path,
-                                                                KeywordArgument(*condition_list[rel][i]))
-
-    def _transform_select(self, select):
-        for i, prop in enumerate(select):
-            if not self._check_if_current_node_property(prop):
-                if prop == 'id':
-                    select[i] = (True, prop)
-                else:
-                    raise AttributeError(
-                        f"{self.node_cls_detail.cls_name} does not have property '{prop}'!")
-            else:
-                select[i] = (False, prop)
-
-    def _write(self, s: str, space=False):
-        self.query_builder.write(s + _space(space))
-
-    def _new_line(self):
-        return self._write("\n")
-
-    def _write_basic_relationship_stmt(self, left: str, rel_var: str, rel_type: str, right: str, node_var: str,
-                                       node_type: str = None):
-        if node_type:
-            self._write(f"{left}[{rel_var}:`{rel_type}`]{right}({node_var}:{node_type}) ")
-        else:
-            self._write(f"{left}[{rel_var}:`{rel_type}`]{right}({node_var}) ")
-
-    def _write_match_stmt(self, var: str, clazz=None, space=True):
-        if clazz is None:
-            self._write(f"{CypherKeyWords.MATCH} ({var}){_space(space)}")
-        else:
-            self._write(f'{CypherKeyWords.MATCH} ({var}:{clazz}){_space(space)}')
-
-    def _write_id_stmt(self, negated: str, variable_name: str, operator: str, value: int):
-        self._write(f"{negated} ID({variable_name}) {operator} {value} ")
-
-    def _write_value_stmt(self, negated: str, variable_name: str, param: str, operator: str, value):
-        self._write(f"{negated} {variable_name}.{param} {operator} {value} ")
-
-    def _write_limit_stmt(self):
-        lmt = self.advanced_filter._limit
-        if lmt:
-            self._write(f"{CypherKeyWords.LIMIT} {lmt} ")
-
-    def _write_where_stmt(self, target_type: type, condition_list: list, connector: CypherKeyWords.KeyWord, var: str,
-                          continuation: bool = False):
-        """
-        Write where statement for the current MATCH query
-        """
-        if not continuation:
-            self._write(CypherKeyWords.WHERE, space=True)
-
-        if connector == CypherKeyWords.OR and len(condition_list) > 1:
-            self._write('(')
-
-        self._write_property_filters(condition_list, connector, target_type, var)
-
-        if connector == CypherKeyWords.OR and len(condition_list) > 1:
-            self._write(') ')
-
-    def _write_skip_stmt(self):
-        skp = self.advanced_filter._skip
-        if skp:
-            self._write(f"{CypherKeyWords.SKIP} {skp} ")
-
-    def _write_order_by_stmt(self, orderby_params):
-        if orderby_params:
-            orderby_stmt = ', '.join([f"{o[0]}.{o[1]} {o[2]}" for o in orderby_params])
-            self._write(f" {CypherKeyWords.ORDER_BY} {orderby_stmt}")
-
-    def _write_return_stmt(self, variable: str, aggregate: str, count=False):
-        if aggregate:
-            self._write(f'{CypherKeyWords.RETURN} {aggregate.name}({variable}.{aggregate.identity[1][1][0]})')
-            return
-
-        select = []
-        if self.advanced_filter._select:
-            select = self.advanced_filter._select
-            self._transform_select(select)
-
-        self._write_distinct_stmt(select, variable)
-
-        self._write(CypherKeyWords.RETURN, space=True)
-
-        if count:
-            self._write(f' COUNT({variable})')
-        else:
-            if select:
-                self._write_select_stmt(select, variable)
-            else:
-                self._write(variable)
-
-    def _write_select_stmt(self, select: list, variable: str):
-        for i, prop in enumerate(select):
-            id_prop, prop = prop
-            if i > 0:
-                self._write(", ")
-
-            if id_prop:
-                self._write(f"ID({variable}) ")
-            else:
-                self._write(f"{variable}.{prop} ")
-
-    def _write_distinct_stmt(self, select: list, variable: str):
-        if self.advanced_filter._distinct:
-            distinct_stmt = ','.join([f"{variable}.{prop}" for is_id, prop in select if not is_id])
-            self._write(f"{CypherKeyWords.WITH} {CypherKeyWords.DISTINCT} {distinct_stmt} ")
-
-    def _no_property_error(self, rel):
-        raise ValueError(
-            f"There is no property or connected Node called {rel} in {self.node_cls_detail.cls_name}")
-
-    def _merge_additional_filter(self, additional_filter):
-        """
-        make cypher for an additional filter and merge it with the current cypher
-        """
-
-        # a counter for each node type, because a node can have a relationship that points to itself
-        # e.g: MATCH (image_1:Image)-[:points_to_another_image]->(image_2:Image)
-        c = self._update_type_counter(type=additional_filter.cls)
-        result = QueryBuilder(additional_filter) \
-            ._build_query(without_return=True, counter=c)
-
-        self._update_type_counter(type=additional_filter.cls, newV=result.type_counter)
-
-        self._write(result.cypher)
-        return result.returned_var
-
-    def _get_type_counter(self, type):
-        c = self.type_counter[type]
-        if c == 0:
-            c = self.counter
-        self.type_counter[type] = c
-        return c
-
-    def _update_type_counter(self, type, newV=None):
-        if newV:
-            self.type_counter[type] = newV
-        else:
-            c = self.type_counter[type]
-            if c == 0:
-                c = self.counter
-            c += 1
-            self.type_counter[type] = c
-            return c
-
-    def _get_var(self, key):
-        """
-        create a variable for the given key
-        """
-        variable = self.variable_table.get(key)
-        exists = True
-        if not variable:
-            exists = False
-            variable = f"var_{key.lower()}_{self.counter}"
-            self._update_variable_table(key, variable)
-        return Variable(exists, variable)
-
-    def _update_variable_table(self, cls_name, var_name):
-        self.variable_table[cls_name] = var_name
-
-    def _clear_variable_table(self, clear_all=True):
-        if clear_all:
-            self.variable_table.clear()
-        else:
-            self.variable_table = {self.node_cls_detail.cls_name: self.variable_table[self.node_cls_detail.cls_name]}
-
-    @classmethod
-    def _convert_nodes_to_ids(cls, target_type, nodes):
-        """
-        convert a list of nodes to a list of ids
-        """
-        check = cls._check_type
-
-        if is_collection(nodes):
-            if nodes:
-                return [cls._to_id(e) for e in nodes if check(e, target_type)]
-            raise ValueError("Empty collection detected")
-        return nodes
-
-    @staticmethod
-    def _to_id(e):
-        if isinstance(e, int):
-            return e
-        else:
-            return e.id
-
-    @staticmethod
-    def _check_type(given_obj, target_type):
-        """
-        check type of given object
-        """
-        if not isinstance(given_obj, StructuredNode) and \
-                not isinstance(given_obj, target_type) and \
-                not isinstance(given_obj, int):
-            raise ValueError(f"Invalid ID values!")
-
-        return True
-
-    @staticmethod
-    def _get_node_detail(clazz: object):
-        details = QueryBuilder.NODE_DETAILS.get(clazz.__name__)
-        if details is None:
-            details = NodeRelationshipDetail(clazz)
-            QueryBuilder.NODE_DETAILS[clazz.__name__] = details
-        return details
 
 
 class AdvancedNodeSet:

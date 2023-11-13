@@ -90,7 +90,7 @@ if __name__ == '__main__':
     print(a.cypher_query)
     print()
 
-    a = Image.filter(user__username="admin", date=Date.filter(year=2020))
+    a = Image.filter(Q(user__username="admin", date=Date.filter(year=2020)))
     print(a.cypher_query)
     print()
 
@@ -132,3 +132,4 @@ if __name__ == '__main__':
 
     a = Image.filter(next_img=Image.filter(next_img__hash_code='a'), prev_img__tag__name='dog')
     print(a.cypher_query)
+    print()
